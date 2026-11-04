@@ -7,3 +7,8 @@ Flask 反向改寫代理，部署在 Render（美國 Oregon）。登入後把網
 - Cookie 簽章：`PROXY_SECRET`
 - 本機跑：`PROXY_PASS=test python3.12 app.py` → http://127.0.0.1:5055
 - 限制：登入態網站、影片、重度 JS 網站不保證可用；WebSocket 不支援。
+
+## 安全邊界（Codex inspect 2026-11-04）
+- 只連解析後驗證過的 IP（防 DNS 重綁定），SNI／憑證驗證仍用原主機名。
+- 每請求獨立 Session，不保存上游 cookie。
+- **架構限制**：所有被代理網站共用代理的瀏覽器 origin，惡意頁面理論上可讀你透過代理看的其他網站。只看公開資訊，不要經代理登入敏感帳號。

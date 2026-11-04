@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>境外站點</title>
+<meta name="description" content="託管於美國的靜態網頁，IP 與 DNS 皆在台灣境外。">
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--ink:#1b1f24;--muted:#5b6470;--line:#e3e6ea;--accent:#2457c5}
+  @media (prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#171b21;--ink:#e8ebef;--muted:#9aa3ad;--line:#2a3038;--accent:#7aa2ff}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 -apple-system,"PingFang TC","Noto Sans TC",system-ui,sans-serif}
+  main{max-width:720px;margin:0 auto;padding:48px 16px 64px}
+  h1{font-size:28px;margin:0 0 8px}
+  .lead{color:var(--muted);margin:0 0 32px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 24px;margin-bottom:20px}
+  .card h2{font-size:16px;margin:0 0 12px;color:var(--muted);font-weight:600;letter-spacing:.02em}
+  dl{display:grid;grid-template-columns:max-content 1fr;gap:8px 20px;margin:0}
+  dt{color:var(--muted)}
+  dd{margin:0;word-break:break-all}
+  code{font:14px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);padding:2px 6px;border-radius:6px}
+  .ok{color:var(--accent);font-weight:600}
+  footer{color:var(--muted);font-size:14px;margin-top:40px}
+</style>
+</head>
+<body>
+<main>
+  <h1>境外站點</h1>
+  <p class="lead">這個網頁的伺服器 IP 與 DNS 名稱伺服器都位於台灣境外。</p>
+
+  <section class="card">
+    <h2>站點資訊</h2>
+    <dl>
+      <dt>網址</dt><dd><code>https://jack13014623-cpu.github.io/overseas-site/</code></dd>
+      <dt>託管</dt><dd>GitHub Pages（Fastly CDN，美國）</dd>
+      <dt>伺服器 IP</dt><dd><code>185.199.108.153</code> 等四組 anycast，<span class="ok">US</span></dd>
+      <dt>DNS 名稱伺服器</dt><dd>AWS Route 53（awsdns）＋ NS1（nsone.net），<span class="ok">皆在境外</span></dd>
+      <dt>憑證</dt><dd>GitHub 自動簽發 HTTPS</dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>內容</h2>
+    <p>這裡是預留的內容區。要換內容，直接編輯 repo 內的 <code>index.html</code> 並推送到 <code>main</code> 分支，約一分鐘後生效。</p>
+  </section>
+
+  <footer>靜態頁面，無後端、無追蹤。</footer>
+</main>
+</body>
+</html>

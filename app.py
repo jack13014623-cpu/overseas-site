@@ -130,13 +130,15 @@ _STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style\s*>)", re.I | re.S)
 _SCRIPT_RE = re.compile(r"(<script\b[^>]*>)(.*?)(</script\s*>)", re.I | re.S)
 _BASE_TAG_RE = re.compile(r"<base\s[^>]*>", re.I | re.S)
 _BASE_HREF_RE = re.compile(r"""(\shref\s*=\s*)(?:(["'])(.*?)\2|([^\s"'>]+))""", re.I | re.S)
-_CSS_URL_RE = re.compile(r"""url\(\s*(["']?)(?!data:)([^"')]+)\1\s*\)""", re.I)
+_CSS_URL_RE = re.compile(r"""url\(\s*(?:(["'])(?!data:)(.*?)\1|(?!data:)([^"')\s]+))\s*\)""", re.I | re.S)
 _CSS_IMPORT_RE = re.compile(r"""@import\s+(["'])([^"']+)\1""", re.I)
 _META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.I | re.S)
 _REFRESH_URL_RE = re.compile(r"""(content\s*=\s*(["']?)[^;"']*;\s*url\s*=\s*)(["']?)([^"'>\s]+)\3""", re.I)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _INTEGRITY_RE = re.compile(r"""\s(?:integrity|crossorigin)\s*=\s*(?:(["']).*?\1|[^\s"'=<>`]+)""", re.I)
-_HEAD_RE = re.compile(r"<head[^>]*>", re.I)
+_HEAD_RE = re.compile(r"<head(?=[\s>])[^>]*>", re.I)       # 不吃 <header>（REV-102）
+_HTML_TAG_RE = re.compile(r"<html(?=[\s>])[^>]*>", re.I)
+_DOCTYPE_RE = re.compile(r"<!doctype\b[^>]*>", re.I)
 
 SHIM = """<script>(function(){
 var B='/p/%(scheme)s/%(host)s',O=location.origin;
@@ -159,7 +161,11 @@ window.open=(function(o){return function(u){arguments[0]=R(u);return o.apply(win
 
 
 def rewrite_css(text: str, base: str) -> str:
-    text = _CSS_URL_RE.sub(lambda m: f"url({m.group(1)}{rewrite_ref(m.group(2), base)}{m.group(1)})", text)
+    def _url(m):                                 # 引號內允許括號（REV-104）
+        q = m.group(1) or ""
+        val = m.group(2) if m.group(1) is not None else m.group(3)
+        return f"url({q}{rewrite_ref(val, base)}{q})"
+    text = _CSS_URL_RE.sub(_url, text)
     return _CSS_IMPORT_RE.sub(lambda m: f"@import {m.group(1)}{rewrite_ref(m.group(2), base)}{m.group(1)}", text)
 
 
@@ -238,15 +244,13 @@ def rewrite_html(text: str, doc_url: str) -> str:
     pieces = _split_scripts(text)               # [markup, open_tag, body, close_tag, markup, ...]
     # 第一個真正的 <base>（只在非 script 片段找，F04）：對文件 URL 解析一次，標籤本身直接換成代理路徑
     base = doc_url
-
+    done = False
     for i in range(0, len(pieces), 4):
-        mb = _first_outside_comments(_BASE_TAG_RE, pieces[i])
-        if not mb:
-            continue
-
-        tag = mb.group(0)
-        mh = _BASE_HREF_RE.search(tag)
-        if mh:
+        for mb in _iter_outside_comments(_BASE_TAG_RE, pieces[i]):   # 第一個「帶 href」的 base（REV-103）
+            tag = mb.group(0)
+            mh = _BASE_HREF_RE.search(tag)
+            if not mh:
+                continue
             href = html.unescape(mh.group(3) if mh.group(2) is not None else mh.group(4)).strip()
             try:
                 base = urljoin(doc_url, href)
@@ -254,7 +258,10 @@ def rewrite_html(text: str, doc_url: str) -> str:
                 base = doc_url
             new_tag = tag[:mh.start()] + f' href="{_esc(to_proxy(base))}"' + tag[mh.end():]
             pieces[i] = pieces[i][:mb.start()] + new_tag + pieces[i][mb.end():]
-        break
+            done = True
+            break
+        if done:
+            break
     sp = urlsplit(doc_url)
     shim = SHIM % {"scheme": sp.scheme, "host": sp.netloc}
     injected = False
@@ -268,9 +275,9 @@ def rewrite_html(text: str, doc_url: str) -> str:
         if i + 1 < len(pieces):
             pieces[i + 1] = _rewrite_tag_attrs(pieces[i + 1], base)   # <script src=...> 要走代理（F02）
     text = "".join(pieces)
-    if not injected:
-        text = shim + text
-
+    if not injected:                             # 沒有 <head>：放 <html> 之後，再退 doctype 之後，絕不插在 doctype 前（REV-102）
+        m = _first_outside_comments(_HTML_TAG_RE, text) or _first_outside_comments(_DOCTYPE_RE, text)
+        text = (text[:m.end()] + shim + text[m.end():]) if m else shim + text
     return text
 
 
@@ -287,13 +294,16 @@ def _split_scripts(text: str) -> list[str]:
     return pieces
 
 
-def _first_outside_comments(rx: re.Pattern, text: str):
-    """第一個不在 <!-- --> 裡的匹配。"""
+def _iter_outside_comments(rx: re.Pattern, text: str):
+    """不在 <!-- --> 裡的匹配，依序。"""
     spans = [c.span() for c in _COMMENT_RE.finditer(text)]
     for m in rx.finditer(text):
         if not any(a <= m.start() < b for a, b in spans):
-            return m
-    return None
+            yield m
+
+
+def _first_outside_comments(rx: re.Pattern, text: str):
+    return next(_iter_outside_comments(rx, text), None)
 
 
 _CHARSET_HDR_RE = re.compile(r"charset=[\"']?\s*([\w.:-]+)", re.I)
@@ -539,6 +549,8 @@ def proxy(scheme: str, host: str, path: str):
 
     if request.method == "HEAD" or up.status_code in (204, 304) or up.status_code < 200:
         _close()                                 # 無 body：立刻釋放連線（REV-07）
+        if not rewritable and up.headers.get("Content-Encoding"):   # 與 GET 原樣串流一致（REV-106）
+            resp_headers.append(("Content-Encoding", up.headers["Content-Encoding"]))
         return Response(b"", up.status_code, resp_headers)
 
     if rewritable:
@@ -642,11 +654,14 @@ def _egress() -> str:
 @app.route("/")
 def index():
     authed = _authed()
-    html = render_template_string(
-        PAGE, authed=authed, next=request.args.get("next", "")[:2000], err=request.args.get("err", ""),
+    nxt = request.args.get("next", "")
+    if not nxt.startswith("/p/"):                # 不截斷（REV-107）；非代理路徑一律回首頁
+        nxt = ""
+    page = render_template_string(
+        PAGE, authed=authed, next=nxt, err=request.args.get("err", ""),
         egress=_egress() if authed else "", base=request.url_root.rstrip("/"),
     )
-    return Response(html, 200, mimetype="text/html")
+    return Response(page, 200, mimetype="text/html")
 
 
 @app.route("/login", methods=["POST"])

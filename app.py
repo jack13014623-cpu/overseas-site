@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import ipaddress
 import os
 import re
@@ -63,7 +64,8 @@ def _gate():
         return None
     if not _authed():
         if request.path.startswith("/p/"):
-            return redirect("/?next=" + quote(request.full_path.rstrip("?")))
+            raw = request.environ.get("RAW_URI") or request.environ.get("REQUEST_URI") or request.full_path.rstrip("?")
+            return redirect("/?next=" + quote(raw))   # 用原始 request-target，%3F 不會變 ?（REV-05）
         abort(401)
     return None
 
@@ -105,7 +107,7 @@ def raw_upstream_target(scheme: str, host: str, path: str) -> str:
         parts = raw[3:].split("/", 2)
         raw_scheme = parts[0]
         raw_host = parts[1].split("?", 1)[0] if len(parts) > 1 else ""
-        if raw_scheme == scheme and unquote(raw_host).lower() == host.lower():
+        if unquote(raw_scheme) == scheme and unquote(raw_host).lower() == host.lower():
             rest = raw[3 + len(raw_scheme) + 1 + len(raw_host):] or "/"
     if rest is None:  # 沒拿到原始字串時退回路由參數重新編碼
         rest = "/" + quote(path, safe="/:@!$&'()*+,;=-._~%")
@@ -186,11 +188,15 @@ def _split_srcset(raw: str) -> list[tuple[str, str]]:
     return out
 
 
+def _esc(v: str) -> str:
+    return html.escape(v, quote=True)
+
+
 def _attr_sub(base: str):
-    def _attr(m):
-        val = m.group(3) if m.group(2) is not None else m.group(4)
+    def _attr(m):                                # 先解 HTML 實體再解析、輸出再轉義（REV-04）
+        val = html.unescape(m.group(3) if m.group(2) is not None else m.group(4))
         q = m.group(2) or '"'
-        return f"{m.group(1)}{q}{rewrite_ref(val, base)}{q}"
+        return f"{m.group(1)}{q}{_esc(rewrite_ref(val, base))}{q}"
     return _attr
 
 
@@ -203,21 +209,21 @@ def _rewrite_tag_attrs(tag: str, base: str) -> str:
 def _rewrite_markup(text: str, base: str) -> str:
     """只處理非 <script> 的片段（R06）。"""
     def _srcset(m):
-        raw = m.group(3) if m.group(2) is not None else m.group(4)
+        raw = html.unescape(m.group(3) if m.group(2) is not None else m.group(4))
         q = m.group(2) or '"'
         parts = [(rewrite_ref(u, base) + (" " + d if d else "")) for u, d in _split_srcset(raw)]
-        return f"{m.group(1)}{q}{', '.join(parts)}{q}"
+        return f"{m.group(1)}{q}{_esc(', '.join(parts))}{q}"
 
     def _style(m):
-        val = m.group(3) if m.group(2) is not None else m.group(4)
+        val = html.unescape(m.group(3) if m.group(2) is not None else m.group(4))
         q = m.group(2) or '"'
-        return f"{m.group(1)}{q}{rewrite_css(val, base)}{q}"
+        return f"{m.group(1)}{q}{_esc(rewrite_css(val, base))}{q}"
 
     def _meta(m):                                # http-equiv=refresh 不限屬性順序（F05）
         tag = m.group(0)
         if not re.search(r"""http-equiv\s*=\s*["']?\s*refresh""", tag, re.I):
             return tag
-        return _REFRESH_URL_RE.sub(lambda r: r.group(1) + r.group(3) + rewrite_ref(r.group(4), base) + r.group(3), tag)
+        return _REFRESH_URL_RE.sub(lambda r: r.group(1) + r.group(3) + _esc(rewrite_ref(html.unescape(r.group(4)), base)) + r.group(3), tag)
 
     text = _META_TAG_RE.sub(_meta, text)
     text = _ATTR_RE.sub(_attr_sub(base), text)
@@ -229,7 +235,7 @@ def _rewrite_markup(text: str, base: str) -> str:
 
 
 def rewrite_html(text: str, doc_url: str) -> str:
-    pieces = _SCRIPT_RE.split(text)             # [markup, open_tag, body, close_tag, markup, ...]
+    pieces = _split_scripts(text)               # [markup, open_tag, body, close_tag, markup, ...]
     # 第一個真正的 <base>（只在非 script 片段找，F04）：對文件 URL 解析一次，標籤本身直接換成代理路徑
     base = doc_url
 
@@ -241,12 +247,12 @@ def rewrite_html(text: str, doc_url: str) -> str:
         tag = mb.group(0)
         mh = _BASE_HREF_RE.search(tag)
         if mh:
-            href = (mh.group(3) if mh.group(2) is not None else mh.group(4)).strip()
+            href = html.unescape(mh.group(3) if mh.group(2) is not None else mh.group(4)).strip()
             try:
                 base = urljoin(doc_url, href)
             except ValueError:
                 base = doc_url
-            new_tag = tag[:mh.start()] + f' href="{to_proxy(base)}"' + tag[mh.end():]
+            new_tag = tag[:mh.start()] + f' href="{_esc(to_proxy(base))}"' + tag[mh.end():]
             pieces[i] = pieces[i][:mb.start()] + new_tag + pieces[i][mb.end():]
         break
     sp = urlsplit(doc_url)
@@ -266,6 +272,19 @@ def rewrite_html(text: str, doc_url: str) -> str:
         text = shim + text
 
     return text
+
+
+def _split_scripts(text: str) -> list[str]:
+    """像 re.split 一樣切出 script 元素，但整份文件先算註解範圍，註解裡的 <script> 不算（REV-03）。"""
+    spans = [c.span() for c in _COMMENT_RE.finditer(text)]
+    pieces, pos = [], 0
+    for m in _SCRIPT_RE.finditer(text):
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        pieces += [text[pos:m.start()], m.group(1), m.group(2), m.group(3)]
+        pos = m.end()
+    pieces.append(text[pos:])
+    return pieces
 
 
 def _first_outside_comments(rx: re.Pattern, text: str):
@@ -349,8 +368,15 @@ class PinnedAdapter(HTTPAdapter):
         super().init_poolmanager(connections, maxsize, block, **kw)
 
 
+class _NoRedirectSession(requests.Session):
+    """allow_redirects=False 時 requests 仍會為 Response.next 把 3xx 的 body 整個讀進記憶體（REV-01），直接關掉。"""
+
+    def resolve_redirects(self, *a, **kw):
+        return iter(())
+
+
 def new_session(hostname: str) -> requests.Session:
-    s = requests.Session()
+    s = _NoRedirectSession()
     s.trust_env = False                          # 不吃環境 proxy，連線目標只有我們釘的 IP
     s.mount("https://", PinnedAdapter(hostname))
     s.mount("http://", HTTPAdapter(max_retries=0))   # 明文 HTTP 不帶 TLS 參數（F01）
@@ -501,11 +527,19 @@ def proxy(scheme: str, host: str, path: str):
     is_html = "text/html" in ctype or "application/xhtml" in ctype
     is_css = "text/css" in ctype
     partial = up.status_code == 206 or "Content-Range" in up.headers
-    rewritable = (is_html or is_css) and request.method != "HEAD" and not partial   # 片段不改寫（F08）
+    rewritable = (is_html or is_css) and not partial   # 片段不改寫（F08）
 
-    def _close():
-        up.close()
-        session.close()
+    closed = []
+
+    def _close():                                # 冪等（REV-07）
+        if not closed:
+            closed.append(1)
+            up.close()
+            session.close()
+
+    if request.method == "HEAD" or up.status_code in (204, 304) or up.status_code < 200:
+        _close()                                 # 無 body：立刻釋放連線（REV-07）
+        return Response(b"", up.status_code, resp_headers)
 
     if rewritable:
         try:
@@ -518,7 +552,9 @@ def proxy(scheme: str, host: str, path: str):
             enc = detect_encoding(prefix, ctype, is_css)
             text = decode_body(prefix, enc)
             text = rewrite_html(text, target) if is_html else rewrite_css(text, target)
-            resp_headers = [(k, v) for k, v in resp_headers if k.lower() != "content-type"]
+            # 改寫後的 bytes 不同於上游，不能沿用上游 validator / range 能力（REV-06）
+            resp_headers = [(k, v) for k, v in resp_headers
+                            if k.lower() not in ("content-type", "etag", "last-modified", "accept-ranges", "content-range")]
             resp_headers.append(("Content-Type", ("text/html" if is_html else "text/css") + "; charset=utf-8"))
             return Response(text.encode("utf-8"), up.status_code, resp_headers)
 
@@ -530,7 +566,10 @@ def proxy(scheme: str, host: str, path: str):
                         yield chunk
             finally:
                 _close()
-        return Response(stream_with_context(gen_big()), up.status_code, resp_headers)
+        resp_headers = [(k, v) for k, v in resp_headers if k.lower() not in ("etag", "last-modified", "accept-ranges")]
+        r = Response(stream_with_context(gen_big()), up.status_code, resp_headers)
+        r.call_on_close(_close)
+        return r
 
     # 不改寫的回應：原樣（不解壓）串流，Content-Encoding 一併轉送，Content-Range 才對得上（R06-3）
     if up.headers.get("Content-Encoding"):
@@ -544,7 +583,9 @@ def proxy(scheme: str, host: str, path: str):
         finally:
             _close()
 
-    return Response(stream_with_context(gen()), up.status_code, resp_headers)
+    r = Response(stream_with_context(gen()), up.status_code, resp_headers)
+    r.call_on_close(_close)
+    return r
 
 
 @app.route("/<path:anything>", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], provide_automatic_options=False)

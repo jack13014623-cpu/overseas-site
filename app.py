@@ -22,7 +22,7 @@ import ipaddress
 import os
 import re
 import socket
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import requests
 from flask import Flask, Response, abort, make_response, redirect, render_template_string, request, stream_with_context
@@ -99,11 +99,15 @@ def rewrite_ref(ref: str, base: str) -> str:
 
 def raw_upstream_target(scheme: str, host: str, path: str) -> str:
     """用瀏覽器送來的原始（未解碼）request-target 組上游 URL（R05）。"""
-    prefix = f"/p/{scheme}/{host}"
     raw = request.environ.get("RAW_URI") or request.environ.get("REQUEST_URI") or ""
-    if raw.startswith(prefix + "/") or raw == prefix or raw.startswith(prefix + "?"):
-        rest = raw[len(prefix):] or "/"
-    else:  # 沒拿到原始字串時退回路由參數重新編碼
+    rest = None
+    if raw.startswith("/p/"):                    # 用結構切，不靠解碼後的主機拼字（R05-3）
+        parts = raw[3:].split("/", 2)
+        raw_scheme = parts[0]
+        raw_host = parts[1].split("?", 1)[0] if len(parts) > 1 else ""
+        if raw_scheme == scheme and unquote(raw_host).lower() == host.lower():
+            rest = raw[3 + len(raw_scheme) + 1 + len(raw_host):] or "/"
+    if rest is None:  # 沒拿到原始字串時退回路由參數重新編碼
         rest = "/" + quote(path, safe="/:@!$&'()*+,;=-._~%")
         if request.query_string:
             rest += "?" + request.query_string.decode("latin-1")
@@ -119,7 +123,7 @@ _ATTR_RE = re.compile(
     re.I | re.S,
 )
 _SRCSET_RE = re.compile(r"""(\s(?:srcset|data-srcset)\s*=\s*)(?:(["'])(.*?)\2|([^\s"'=<>`]+))""", re.I | re.S)
-_STYLE_ATTR_RE = re.compile(r"""(\sstyle\s*=\s*)(["'])(.*?)\2""", re.I | re.S)
+_STYLE_ATTR_RE = re.compile(r"""(\sstyle\s*=\s*)(?:(["'])(.*?)\2|([^\s"'=<>`]+))""", re.I | re.S)
 _STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style\s*>)", re.I | re.S)
 _SCRIPT_RE = re.compile(r"(<script\b[^>]*>)(.*?)(</script\s*>)", re.I | re.S)
 _BASE_TAG_RE = re.compile(r"<base\s[^>]*>", re.I | re.S)
@@ -127,7 +131,8 @@ _BASE_HREF_RE = re.compile(r"""(\shref\s*=\s*)(?:(["'])(.*?)\2|([^\s"'>]+))""", 
 _CSS_URL_RE = re.compile(r"""url\(\s*(["']?)(?!data:)([^"')]+)\1\s*\)""", re.I)
 _CSS_IMPORT_RE = re.compile(r"""@import\s+(["'])([^"']+)\1""", re.I)
 _META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.I | re.S)
-_REFRESH_URL_RE = re.compile(r"""(content\s*=\s*(["'])[^;"']*;\s*url\s*=\s*)([^"'>]+)""", re.I)
+_REFRESH_URL_RE = re.compile(r"""(content\s*=\s*(["']?)[^;"']*;\s*url\s*=\s*)(["']?)([^"'>\s]+)\3""", re.I)
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _INTEGRITY_RE = re.compile(r"""\s(?:integrity|crossorigin)\s*=\s*(?:(["']).*?\1|[^\s"'=<>`]+)""", re.I)
 _HEAD_RE = re.compile(r"<head[^>]*>", re.I)
 
@@ -156,6 +161,31 @@ def rewrite_css(text: str, base: str) -> str:
     return _CSS_IMPORT_RE.sub(lambda m: f"@import {m.group(1)}{rewrite_ref(m.group(2), base)}{m.group(1)}", text)
 
 
+def _split_srcset(raw: str) -> list[tuple[str, str]]:
+    """照 HTML 規格切 srcset：URL 是連續非空白字元（data URL 裡的逗號不會被切開），描述子到下一個逗號為止（R02-3）。"""
+    out, i, n = [], 0, len(raw)
+    while i < n:
+        while i < n and raw[i] in " \t\n\r\f,":
+            i += 1
+        if i >= n:
+            break
+        j = i
+        while j < n and raw[j] not in " \t\n\r\f":
+            j += 1
+        url, desc = raw[i:j], ""
+        if url.endswith(","):
+            url = url.rstrip(",")
+        else:
+            k = j
+            while k < n and raw[k] != ",":
+                k += 1
+            desc, j = raw[j:k].strip(), k
+        if url:
+            out.append((url, desc))
+        i = j
+    return out
+
+
 def _attr_sub(base: str):
     def _attr(m):
         val = m.group(3) if m.group(2) is not None else m.group(4)
@@ -175,28 +205,25 @@ def _rewrite_markup(text: str, base: str) -> str:
     def _srcset(m):
         raw = m.group(3) if m.group(2) is not None else m.group(4)
         q = m.group(2) or '"'
-        if "data:" in raw.lower():               # data URL 含逗號，拆不準就原樣保留（F05）
-            return m.group(0)
-        parts = []
-        for cand in raw.split(","):
-            bits = cand.strip().split(None, 1)
-            if not bits:
-                continue
-            bits[0] = rewrite_ref(bits[0], base)
-            parts.append(" ".join(bits))
+        parts = [(rewrite_ref(u, base) + (" " + d if d else "")) for u, d in _split_srcset(raw)]
         return f"{m.group(1)}{q}{', '.join(parts)}{q}"
+
+    def _style(m):
+        val = m.group(3) if m.group(2) is not None else m.group(4)
+        q = m.group(2) or '"'
+        return f"{m.group(1)}{q}{rewrite_css(val, base)}{q}"
 
     def _meta(m):                                # http-equiv=refresh 不限屬性順序（F05）
         tag = m.group(0)
         if not re.search(r"""http-equiv\s*=\s*["']?\s*refresh""", tag, re.I):
             return tag
-        return _REFRESH_URL_RE.sub(lambda r: r.group(1) + rewrite_ref(r.group(3), base), tag)
+        return _REFRESH_URL_RE.sub(lambda r: r.group(1) + r.group(3) + rewrite_ref(r.group(4), base) + r.group(3), tag)
 
     text = _META_TAG_RE.sub(_meta, text)
     text = _ATTR_RE.sub(_attr_sub(base), text)
     text = _SRCSET_RE.sub(_srcset, text)
     text = _INTEGRITY_RE.sub("", text)          # 改寫過的資源 SRI 一定不符，拿掉
-    text = _STYLE_ATTR_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{rewrite_css(m.group(3), base)}{m.group(2)}", text)
+    text = _STYLE_ATTR_RE.sub(_style, text)
     text = _STYLE_BLOCK_RE.sub(lambda m: m.group(1) + rewrite_css(m.group(2), base) + m.group(3), text)
     return text
 
@@ -205,10 +232,12 @@ def rewrite_html(text: str, doc_url: str) -> str:
     pieces = _SCRIPT_RE.split(text)             # [markup, open_tag, body, close_tag, markup, ...]
     # 第一個真正的 <base>（只在非 script 片段找，F04）：對文件 URL 解析一次，標籤本身直接換成代理路徑
     base = doc_url
+
     for i in range(0, len(pieces), 4):
-        mb = _BASE_TAG_RE.search(pieces[i])
+        mb = _first_outside_comments(_BASE_TAG_RE, pieces[i])
         if not mb:
             continue
+
         tag = mb.group(0)
         mh = _BASE_HREF_RE.search(tag)
         if mh:
@@ -220,17 +249,32 @@ def rewrite_html(text: str, doc_url: str) -> str:
             new_tag = tag[:mh.start()] + f' href="{to_proxy(base)}"' + tag[mh.end():]
             pieces[i] = pieces[i][:mb.start()] + new_tag + pieces[i][mb.end():]
         break
+    sp = urlsplit(doc_url)
+    shim = SHIM % {"scheme": sp.scheme, "host": sp.netloc}
+    injected = False
     for i in range(0, len(pieces), 4):
         pieces[i] = _rewrite_markup(pieces[i], base)
+        if not injected:                         # shim 只插在真正的 <head>，不碰 script 字串（R01-3）
+            mh = _first_outside_comments(_HEAD_RE, pieces[i])
+            if mh:
+                pieces[i] = pieces[i][:mh.end()] + shim + pieces[i][mh.end():]
+                injected = True
         if i + 1 < len(pieces):
             pieces[i + 1] = _rewrite_tag_attrs(pieces[i + 1], base)   # <script src=...> 要走代理（F02）
     text = "".join(pieces)
-    sp = urlsplit(doc_url)
-    shim = SHIM % {"scheme": sp.scheme, "host": sp.netloc}
-    text, n = _HEAD_RE.subn(lambda m: m.group(0) + shim, text, count=1)
-    if n == 0:
+    if not injected:
         text = shim + text
+
     return text
+
+
+def _first_outside_comments(rx: re.Pattern, text: str):
+    """第一個不在 <!-- --> 裡的匹配。"""
+    spans = [c.span() for c in _COMMENT_RE.finditer(text)]
+    for m in rx.finditer(text):
+        if not any(a <= m.start() < b for a, b in spans):
+            return m
+    return None
 
 
 _CHARSET_HDR_RE = re.compile(r"charset=[\"']?\s*([\w.:-]+)", re.I)
@@ -337,7 +381,19 @@ _STRIP_RESP = _HOP_BY_HOP | {
 }
 _STRIP_REQ = _HOP_BY_HOP | {"host", "cookie", "referer", "origin", "accept-encoding", "x-real-ip", "true-client-ip",
                             "cdn-loop", "forwarded", "via", "x-request-start", "x-request-id"}
-_PRIVATE_CACHE = [("Cache-Control", "private, no-cache"), ("Vary", "Cookie")]
+
+
+@app.after_request
+def _private_cache(resp):
+    """所有回應（含 302/403/404/502 與框架產生的錯誤）一律 private（R07-3）。"""
+    if request.path == "/healthz":
+        return resp
+    resp.headers["Cache-Control"] = "private, no-cache"
+    vary = [v.strip() for v in resp.headers.get("Vary", "").split(",") if v.strip()]
+    if not any(v.lower() == "cookie" for v in vary):
+        vary.append("Cookie")
+    resp.headers["Vary"] = ", ".join(vary)
+    return resp
 _STRIP_REQ_PREFIX = ("x-forwarded-", "x-render-", "render-", "cf-", "x-real-")
 
 _PROXY_PATH_RE = re.compile(r"^/p/(https?)/([^/]+)")
@@ -403,7 +459,7 @@ def proxy(scheme: str, host: str, path: str):
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in drop and not k.lower().startswith(_STRIP_REQ_PREFIX)}
     headers["Host"] = host
-    headers["Accept-Encoding"] = "gzip, deflate"
+    headers["Accept-Encoding"] = "identity" if "Range" in request.headers else "gzip, deflate"   # 片段不能解壓（R06-3）
     cookie = _strip_own_cookies(request.headers.get("Cookie", ""))
     if cookie:
         headers["Cookie"] = cookie
@@ -433,7 +489,7 @@ def proxy(scheme: str, host: str, path: str):
         return Response(f"上游連線失敗：{type(e).__name__}", 502, mimetype="text/plain; charset=utf-8")
 
     drop_resp = _STRIP_RESP | _nominated(up.headers)
-    resp_headers = [(k, v) for k, v in up.headers.items() if k.lower() not in drop_resp] + _PRIVATE_CACHE
+    resp_headers = [(k, v) for k, v in up.headers.items() if k.lower() not in drop_resp]
     if "Location" in up.headers:
         resp_headers.append(("Location", rewrite_ref(up.headers["Location"], target)))
     for sc in up.raw.headers.getlist("Set-Cookie"):
@@ -476,9 +532,13 @@ def proxy(scheme: str, host: str, path: str):
                 _close()
         return Response(stream_with_context(gen_big()), up.status_code, resp_headers)
 
+    # 不改寫的回應：原樣（不解壓）串流，Content-Encoding 一併轉送，Content-Range 才對得上（R06-3）
+    if up.headers.get("Content-Encoding"):
+        resp_headers.append(("Content-Encoding", up.headers["Content-Encoding"]))
+
     def gen():
         try:
-            for chunk in up.iter_content(64 * 1024):
+            for chunk in up.raw.stream(64 * 1024, decode_content=False):
                 if chunk:
                     yield chunk
         finally:
@@ -545,7 +605,7 @@ def index():
         PAGE, authed=authed, next=request.args.get("next", "")[:2000], err=request.args.get("err", ""),
         egress=_egress() if authed else "", base=request.url_root.rstrip("/"),
     )
-    return Response(html, 200, _PRIVATE_CACHE, mimetype="text/html")
+    return Response(html, 200, mimetype="text/html")
 
 
 @app.route("/login", methods=["POST"])

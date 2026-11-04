@@ -1,0 +1,14 @@
+# 境外網頁代理 — Render 免費方案（實際服務由 Render API 建立；此檔當文件）
+services:
+  - type: web
+    name: overseas-proxy
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --workers 2 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT"
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      # PROXY_PASS / PROXY_SECRET 在 Render dashboard Environment 設，不進 git

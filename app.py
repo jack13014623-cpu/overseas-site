@@ -118,15 +118,17 @@ _ATTR_RE = re.compile(
     r"""(\s(?:href|src|action|poster|formaction|data-src|data-href)\s*=\s*)(?:(["'])(.*?)\2|([^\s"'=<>`]+))""",
     re.I | re.S,
 )
-_SRCSET_RE = re.compile(r"""(\s(?:srcset|data-srcset)\s*=\s*)(["'])(.*?)\2""", re.I | re.S)
+_SRCSET_RE = re.compile(r"""(\s(?:srcset|data-srcset)\s*=\s*)(?:(["'])(.*?)\2|([^\s"'=<>`]+))""", re.I | re.S)
 _STYLE_ATTR_RE = re.compile(r"""(\sstyle\s*=\s*)(["'])(.*?)\2""", re.I | re.S)
 _STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style\s*>)", re.I | re.S)
-_SCRIPT_SPLIT_RE = re.compile(r"(<script\b[^>]*>.*?</script\s*>)", re.I | re.S)
-_BASE_RE = re.compile(r"""<base\s[^>]*?href\s*=\s*(?:(["'])(.*?)\1|([^\s"'>]+))""", re.I | re.S)
+_SCRIPT_RE = re.compile(r"(<script\b[^>]*>)(.*?)(</script\s*>)", re.I | re.S)
+_BASE_TAG_RE = re.compile(r"<base\s[^>]*>", re.I | re.S)
+_BASE_HREF_RE = re.compile(r"""(\shref\s*=\s*)(?:(["'])(.*?)\2|([^\s"'>]+))""", re.I | re.S)
 _CSS_URL_RE = re.compile(r"""url\(\s*(["']?)(?!data:)([^"')]+)\1\s*\)""", re.I)
 _CSS_IMPORT_RE = re.compile(r"""@import\s+(["'])([^"']+)\1""", re.I)
-_META_REFRESH_RE = re.compile(r"""(<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^;"']*;\s*url=)([^"'>]+)""", re.I)
-_INTEGRITY_RE = re.compile(r"""\s(?:integrity|crossorigin)\s*=\s*(["']).*?\1""", re.I)
+_META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.I | re.S)
+_REFRESH_URL_RE = re.compile(r"""(content\s*=\s*(["'])[^;"']*;\s*url\s*=\s*)([^"'>]+)""", re.I)
+_INTEGRITY_RE = re.compile(r"""\s(?:integrity|crossorigin)\s*=\s*(?:(["']).*?\1|[^\s"'=<>`]+)""", re.I)
 _HEAD_RE = re.compile(r"<head[^>]*>", re.I)
 
 SHIM = """<script>(function(){
@@ -154,26 +156,45 @@ def rewrite_css(text: str, base: str) -> str:
     return _CSS_IMPORT_RE.sub(lambda m: f"@import {m.group(1)}{rewrite_ref(m.group(2), base)}{m.group(1)}", text)
 
 
-def _rewrite_markup(text: str, base: str) -> str:
-    """只處理非 <script> 的片段（R06）。"""
+def _attr_sub(base: str):
     def _attr(m):
         val = m.group(3) if m.group(2) is not None else m.group(4)
         q = m.group(2) or '"'
         return f"{m.group(1)}{q}{rewrite_ref(val, base)}{q}"
+    return _attr
 
+
+def _rewrite_tag_attrs(tag: str, base: str) -> str:
+    """只改一個開頭標籤裡的 URL 屬性並拿掉 SRI（用於 <script ...> 開頭標籤，F02）。"""
+    tag = _ATTR_RE.sub(_attr_sub(base), tag)
+    return _INTEGRITY_RE.sub("", tag)
+
+
+def _rewrite_markup(text: str, base: str) -> str:
+    """只處理非 <script> 的片段（R06）。"""
     def _srcset(m):
+        raw = m.group(3) if m.group(2) is not None else m.group(4)
+        q = m.group(2) or '"'
+        if "data:" in raw.lower():               # data URL 含逗號，拆不準就原樣保留（F05）
+            return m.group(0)
         parts = []
-        for cand in m.group(3).split(","):
+        for cand in raw.split(","):
             bits = cand.strip().split(None, 1)
             if not bits:
                 continue
             bits[0] = rewrite_ref(bits[0], base)
             parts.append(" ".join(bits))
-        return f"{m.group(1)}{m.group(2)}{', '.join(parts)}{m.group(2)}"
+        return f"{m.group(1)}{q}{', '.join(parts)}{q}"
 
-    text = _ATTR_RE.sub(_attr, text)
+    def _meta(m):                                # http-equiv=refresh 不限屬性順序（F05）
+        tag = m.group(0)
+        if not re.search(r"""http-equiv\s*=\s*["']?\s*refresh""", tag, re.I):
+            return tag
+        return _REFRESH_URL_RE.sub(lambda r: r.group(1) + rewrite_ref(r.group(3), base), tag)
+
+    text = _META_TAG_RE.sub(_meta, text)
+    text = _ATTR_RE.sub(_attr_sub(base), text)
     text = _SRCSET_RE.sub(_srcset, text)
-    text = _META_REFRESH_RE.sub(lambda m: m.group(1) + rewrite_ref(m.group(2), base), text)
     text = _INTEGRITY_RE.sub("", text)          # 改寫過的資源 SRI 一定不符，拿掉
     text = _STYLE_ATTR_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{rewrite_css(m.group(3), base)}{m.group(2)}", text)
     text = _STYLE_BLOCK_RE.sub(lambda m: m.group(1) + rewrite_css(m.group(2), base) + m.group(3), text)
@@ -181,16 +202,28 @@ def _rewrite_markup(text: str, base: str) -> str:
 
 
 def rewrite_html(text: str, doc_url: str) -> str:
+    pieces = _SCRIPT_RE.split(text)             # [markup, open_tag, body, close_tag, markup, ...]
+    # 第一個真正的 <base>（只在非 script 片段找，F04）：對文件 URL 解析一次，標籤本身直接換成代理路徑
     base = doc_url
-    mb = _BASE_RE.search(text)
-    if mb:
-        try:
-            base = urljoin(doc_url, (mb.group(2) if mb.group(2) is not None else mb.group(3)).strip())
-        except ValueError:
-            pass
-    pieces = _SCRIPT_SPLIT_RE.split(text)
-    for i in range(0, len(pieces), 2):          # 偶數索引是非 script 片段
+    for i in range(0, len(pieces), 4):
+        mb = _BASE_TAG_RE.search(pieces[i])
+        if not mb:
+            continue
+        tag = mb.group(0)
+        mh = _BASE_HREF_RE.search(tag)
+        if mh:
+            href = (mh.group(3) if mh.group(2) is not None else mh.group(4)).strip()
+            try:
+                base = urljoin(doc_url, href)
+            except ValueError:
+                base = doc_url
+            new_tag = tag[:mh.start()] + f' href="{to_proxy(base)}"' + tag[mh.end():]
+            pieces[i] = pieces[i][:mb.start()] + new_tag + pieces[i][mb.end():]
+        break
+    for i in range(0, len(pieces), 4):
         pieces[i] = _rewrite_markup(pieces[i], base)
+        if i + 1 < len(pieces):
+            pieces[i + 1] = _rewrite_tag_attrs(pieces[i + 1], base)   # <script src=...> 要走代理（F02）
     text = "".join(pieces)
     sp = urlsplit(doc_url)
     shim = SHIM % {"scheme": sp.scheme, "host": sp.netloc}
@@ -276,7 +309,7 @@ def new_session(hostname: str) -> requests.Session:
     s = requests.Session()
     s.trust_env = False                          # 不吃環境 proxy，連線目標只有我們釘的 IP
     s.mount("https://", PinnedAdapter(hostname))
-    s.mount("http://", PinnedAdapter(hostname))
+    s.mount("http://", HTTPAdapter(max_retries=0))   # 明文 HTTP 不帶 TLS 參數（F01）
     return s
 
 
@@ -292,16 +325,19 @@ def pin_url(target: str, ip: str, port: int) -> str:
 
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te",
-    "trailer", "trailers", "transfer-encoding", "upgrade", "content-encoding", "content-length",
+    "trailer", "trailers", "transfer-encoding", "upgrade", "content-length",
 }
 _STRIP_RESP = _HOP_BY_HOP | {
+    "content-encoding",                          # requests 已解壓；請求端的 Content-Encoding 原樣轉送（F06）
     "content-security-policy", "content-security-policy-report-only", "x-frame-options",
     "strict-transport-security", "public-key-pins", "cross-origin-opener-policy",
     "cross-origin-embedder-policy", "cross-origin-resource-policy", "report-to", "nel", "alt-svc",
     "set-cookie", "location", "link",
+    "cache-control", "expires", "pragma", "vary",   # 代理回應一律 private（F09）
 }
 _STRIP_REQ = _HOP_BY_HOP | {"host", "cookie", "referer", "origin", "accept-encoding", "x-real-ip", "true-client-ip",
                             "cdn-loop", "forwarded", "via", "x-request-start", "x-request-id"}
+_PRIVATE_CACHE = [("Cache-Control", "private, no-cache"), ("Vary", "Cookie")]
 _STRIP_REQ_PREFIX = ("x-forwarded-", "x-render-", "render-", "cf-", "x-real-")
 
 _PROXY_PATH_RE = re.compile(r"^/p/(https?)/([^/]+)")
@@ -372,11 +408,18 @@ def proxy(scheme: str, host: str, path: str):
     if cookie:
         headers["Cookie"] = cookie
     ref = request.headers.get("Referer", "")
-    m = _PROXY_PATH_RE.match(urlsplit(ref).path) if ref else None
-    if m:
-        headers["Referer"] = f"{m.group(1)}://{m.group(2)}" + urlsplit(ref).path[len(m.group(0)):]
-        if request.headers.get("Origin"):
+    rs = urlsplit(ref) if ref else None
+    m = _PROXY_PATH_RE.match(rs.path) if rs else None
+    if m:                                        # Referer 連 query 一起還原（F07）
+        headers["Referer"] = f"{m.group(1)}://{m.group(2)}" + rs.path[len(m.group(0)):] + (f"?{rs.query}" if rs.query else "")
+    origin = request.headers.get("Origin")
+    if origin:
+        if origin == "null":
+            headers["Origin"] = "null"           # opaque origin 原樣保留
+        elif m:
             headers["Origin"] = f"{m.group(1)}://{m.group(2)}"
+        else:                                    # no-referrer 頁面：最合理的來源就是目標站本身
+            headers["Origin"] = f"{scheme}://{host}"
 
     session = new_session(hostname)
     try:
@@ -390,7 +433,7 @@ def proxy(scheme: str, host: str, path: str):
         return Response(f"上游連線失敗：{type(e).__name__}", 502, mimetype="text/plain; charset=utf-8")
 
     drop_resp = _STRIP_RESP | _nominated(up.headers)
-    resp_headers = [(k, v) for k, v in up.headers.items() if k.lower() not in drop_resp]
+    resp_headers = [(k, v) for k, v in up.headers.items() if k.lower() not in drop_resp] + _PRIVATE_CACHE
     if "Location" in up.headers:
         resp_headers.append(("Location", rewrite_ref(up.headers["Location"], target)))
     for sc in up.raw.headers.getlist("Set-Cookie"):
@@ -401,7 +444,8 @@ def proxy(scheme: str, host: str, path: str):
     ctype = up.headers.get("Content-Type", "")
     is_html = "text/html" in ctype or "application/xhtml" in ctype
     is_css = "text/css" in ctype
-    rewritable = (is_html or is_css) and request.method != "HEAD"
+    partial = up.status_code == 206 or "Content-Range" in up.headers
+    rewritable = (is_html or is_css) and request.method != "HEAD" and not partial   # 片段不改寫（F08）
 
     def _close():
         up.close()
@@ -443,7 +487,7 @@ def proxy(scheme: str, host: str, path: str):
     return Response(stream_with_context(gen()), up.status_code, resp_headers)
 
 
-@app.route("/<path:anything>", methods=["GET", "POST", "HEAD"])
+@app.route("/<path:anything>", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], provide_automatic_options=False)
 def catch_all(anything: str):
     """JS 用絕對路徑 (/foo) 打到代理根目錄時，用 Referer 推回原站。"""
     ref = request.headers.get("Referer", "")
@@ -497,10 +541,11 @@ def _egress() -> str:
 @app.route("/")
 def index():
     authed = _authed()
-    return render_template_string(
+    html = render_template_string(
         PAGE, authed=authed, next=request.args.get("next", "")[:2000], err=request.args.get("err", ""),
         egress=_egress() if authed else "", base=request.url_root.rstrip("/"),
     )
+    return Response(html, 200, _PRIVATE_CACHE, mimetype="text/html")
 
 
 @app.route("/login", methods=["POST"])

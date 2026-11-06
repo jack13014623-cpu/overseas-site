@@ -634,8 +634,8 @@ button{padding:12px 18px;border:0;border-radius:10px;background:#2457c5;color:#f
 {% if err %}<p class="err">{{ err }}</p>{% endif %}
 {% else %}
 <p class="m">貼上要看的網址，連線會從這台境外主機發出。</p>
-<form onsubmit="var u=this.u.value.trim();if(!/^https?:\\/\\//i.test(u))u='https://'+u;var a=new URL(u);location.href='/p/'+a.protocol.slice(0,-1)+'/'+a.host+a.pathname+a.search+a.hash;return false;">
-<input name="u" placeholder="https://example.com" autofocus required><button>前往</button></form>
+<form method="get" action="/"><input name="u" placeholder="https://example.com" autofocus required><button>前往</button></form>
+{% if err %}<p class="err">{{ err }}</p>{% endif %}
 <div class="card"><b>這台主機的出口</b><br>{{ egress }}</div>
 <div class="card">書籤格式：<code>{{ base }}/p/https/網域/路徑</code><br>登入／影片／重度 JS 的網站可能無法正常運作。</div>
 <div class="card warn"><b>只看公開資訊。</b>所有被代理的網站共用同一個瀏覽器 origin，不要透過代理登入銀行、信箱等敏感帳號。</div>
@@ -651,9 +651,27 @@ def _egress() -> str:
         return f"查詢失敗（{type(e).__name__}）"
 
 
+def _target_from_input(u: str) -> str | None:
+    """首頁表單輸入 → /p/... 路徑；不靠瀏覽器端 JS（有用戶的瀏覽器送成了 GET /?u=）。"""
+    u = (u or "").strip()
+    if not u:
+        return None
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    sp = urlsplit(u)
+    if not sp.netloc or sp.scheme.lower() not in ("http", "https"):
+        return None
+    return to_proxy(sp._replace(scheme=sp.scheme.lower()).geturl())
+
+
 @app.route("/")
 def index():
     authed = _authed()
+    if authed and request.args.get("u"):
+        tgt = _target_from_input(request.args.get("u"))
+        if tgt:
+            return redirect(tgt)
+        return redirect("/?err=" + quote("網址無效"))
     nxt = request.args.get("next", "")
     if not nxt.startswith("/p/"):                # 不截斷（REV-107）；非代理路徑一律回首頁
         nxt = ""
